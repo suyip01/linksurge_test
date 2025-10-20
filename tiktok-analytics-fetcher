@@ -1,1 +1,154 @@
+const { spawn } = require('child_process');
+const path = require('path');
+
+// 1. yt-dlp.exe 路径
+const executablePath = path.join(__dirname, 'yt-dlp.exe');
+
+// 2. 目标URL
+const targetUrl = 'https://www.tiktok.com/@cofierlashes';//目标URL
+
+// 3. 代理
+const proxy = 'http://127.0.0.1:33210'; // 自己的代理
+
+// 主函数执行
+(async () => {
+    try {
+        const result = await getVideoStatsWithTags(targetUrl);
+        console.log('\n[✅ 测试结果] 最近10个视频统计与标签聚合：');
+        console.dir(result, { depth: null });
+    } catch (e) {
+        console.error('[❌ 测试失败]', e);
+    }
+})();
+
+/**
+ * 提取标签（#开头或从描述文本中切词）
+ */
+function extractTags(description) {
+    if (!description) return [];
+    const hashTagReg = /#([\u4e00-\u9fa5\w-]+)/g;
+    let tags = [];
+    let match;
+    while ((match = hashTagReg.exec(description))) {
+        tags.push(match[1].toLowerCase());
+    }
+
+    // 拆词（按空格、标点分词）
+    const words = description
+        .replace(/[\n\r,\.!?，。！？、]/g, ' ')
+        .split(/\s+/)
+        .map(w => w.trim().toLowerCase())
+        .filter(w => w.length > 1 && !w.startsWith('http'));
+    
+    return Array.from(new Set([...tags, ...words]));
+}
+
+/**
+ * 调用 yt-dlp 获取数据并聚合
+ */
+async function getVideoStatsWithTags(targetUrl) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            '--proxy', proxy,
+            '--dateafter', 'now-30days', // 最近30天
+            '--dump-json',
+            '--no-playlist',
+            targetUrl
+        ];
+
+        const child = spawn(executablePath, args, { shell: false });
+
+        let output = '';
+        let errorOutput = '';
+
+        child.stdout.on('data', data => {
+            output += data.toString();
+        });
+
+        child.stderr.on('data', data => {
+            errorOutput += data.toString();
+        });
+
+        child.on('close', code => {
+            if (code !== 0) {
+                reject(errorOutput || `yt-dlp 退出码: ${code}`);
+                return;
+            }
+
+            try {
+                // 解析 JSON 输出
+                const rawLines = output
+                    .split('\n')
+                    .filter(line => line.trim().startsWith('{'))
+                    .map(line => JSON.parse(line));
+
+                const videos = rawLines.map(v => ({
+                    id: v.id || '',
+                    title: v.title || '',
+                    description: v.description || '',
+                    view_count: v.view_count || 0,
+                    like_count: v.like_count || 0,
+                    comment_count: v.comment_count || 0,
+                    date: v.upload_date || v.release_date
+                }));
+
+                // 过滤时间范围（最近30天）
+                const now = Date.now();
+                const oneMonthAgo = now - 1000 * 60 * 60 * 24 * 30;
+
+                const validVideos = videos.filter(v => {
+                    if (!v.date) return false;
+                    const t = new Date(
+                        v.date.length === 8 ? `${v.date.slice(0,4)}-${v.date.slice(4,6)}-${v.date.slice(6,8)}` : v.date
+                    ).getTime();
+                    return !isNaN(t) && t >= oneMonthAgo && t <= now;
+                });
+
+                // 最近10个视频（按日期倒序）
+                const topVideos = validVideos
+                    .sort((a, b) => new Date(b.date) - new Date(a.date))
+                    .slice(0, 10);
+
+                // 平均值计算函数
+                const avg = (arr, key) =>
+                    arr.length === 0 ? 0 :
+                    Math.round(arr.reduce((sum, v) => sum + (v[key] || 0), 0) / arr.length);
+
+                // 平均统计
+                const avgStats = {
+                    avg_view_count: avg(topVideos, 'view_count'),
+                    avg_like_count: avg(topVideos, 'like_count'),
+                    avg_comment_count: avg(topVideos, 'comment_count')
+                };
+
+                // 标签聚合统计
+                const tagCount = {};
+                topVideos.forEach(v => {
+                    const tags = extractTags(v.description);
+                    tags.forEach(t => {
+                        tagCount[t] = (tagCount[t] || 0) + 1;
+                    });
+                });
+
+                const sortedTags = Object.entries(tagCount)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([tag, count]) => ({ tag, count }));
+
+                resolve({
+                    stats: avgStats,
+                    tags: sortedTags,
+                    videos: topVideos.map(v => ({
+                        title: v.title,
+                        view_count: v.view_count,
+                        like_count: v.like_count,
+                        comment_count: v.comment_count,
+                        date: v.date
+                    }))
+                });
+            } catch (err) {
+                reject(`解析JSON失败: ${err}\n原始输出: ${output.slice(0, 300)}...`);
+            }
+        });
+    });
+}
 
